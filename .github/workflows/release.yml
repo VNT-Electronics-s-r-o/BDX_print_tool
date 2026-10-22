@@ -1,0 +1,137 @@
+
+name: Build and package application
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_ID: bdx-print-tool
+  SPEC_PATH: packaging/bdx_print_tool.spec
+  BUILD_DIR: dist/bdx_print_tool
+  RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL || 'https://192.168.1.95:8765' }}
+
+jobs:
+  build:
+    if: (github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted) || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        run: |
+          if ($env:GITHUB_REF_TYPE -ne "tag" -or
+              $env:GITHUB_REF_NAME -cnotmatch '^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$') {
+            throw "Select a version tag such as v1.2.3 (no leading zeroes)."
+          }
+
+          "APP_VERSION=$($Matches[1])" >> $env:GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            packaging/requirements-build.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r packaging/requirements-build.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Dependency installation failed."
+          }
+
+          python -m pip check
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+
+      - name: Build application
+        run: |
+          python -m PyInstaller --noconfirm --clean $env:SPEC_PATH
+
+      - name: Validate package and manifest
+        run: |
+          python packaging/build_release.py `
+            --version $env:APP_VERSION `
+            --app-id $env:APP_ID `
+            --base-url $env:RELEASE_BASE_URL
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Package generation or validation failed."
+          }
+
+      - name: Create outer release ZIP
+        run: |
+          $version = $env:APP_VERSION
+          $stagingRoot = "staging"
+          $staging = Join-Path $stagingRoot $version
+          $releaseDir = "release"
+          $versionReleaseDir = Join-Path $releaseDir $version
+          $outerZip = Join-Path $releaseDir "$($env:APP_ID)-$version.zip"
+
+          if (-not (Test-Path "$versionReleaseDir/manifest.json" -PathType Leaf)) {
+              throw "Manifest was not generated in $versionReleaseDir."
+          }
+          if (-not (Test-Path "$versionReleaseDir/package.zip" -PathType Leaf)) {
+              throw "Package was not generated in $versionReleaseDir."
+          }
+
+          Remove-Item $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $staging | Out-Null
+
+          Copy-Item "$versionReleaseDir/manifest.json" "$staging/manifest.json"
+          Copy-Item "$versionReleaseDir/package.zip" "$staging/package.zip"
+
+          Remove-Item $outerZip -Force -ErrorAction SilentlyContinue
+
+          Compress-Archive `
+            -Path $staging `
+            -DestinationPath $outerZip `
+            -Force
+
+          if (-not (Test-Path $outerZip -PathType Leaf)) {
+            throw "Outer release ZIP was not created: $outerZip"
+          }
+
+          Write-Host "Created $outerZip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_ID }}-${{ env.APP_VERSION }}
+          path: |
+            release/${{ env.APP_VERSION }}/package.zip
+            release/${{ env.APP_VERSION }}/manifest.json
+            release/${{ env.APP_ID }}-${{ env.APP_VERSION }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ env.APP_ID }}-${{ env.APP_VERSION }}.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
