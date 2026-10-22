@@ -5,7 +5,7 @@ from shutil import copyfile
 
 project_dir = Path(SPECPATH).resolve().parent
 executable = 'bdx_print_tool.py'
-icon_name = 'printing.ico'
+icon_name = 'printer.ico'
 dir_name = 'bdx_print_tool'
 
 a = Analysis(
